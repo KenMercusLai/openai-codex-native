@@ -1,0 +1,39 @@
+{
+    "id": "openai-codex-native",
+    "name": "OpenAI Codex Native",
+    "version": "1.0.0",
+    "description": "Use ChatGPT Plus/Pro subscription with Alma via local Codex CLI app-server. Bypasses Cloudflare by delegating requests to the codex binary.",
+    "author": {
+        "name": "Alma Community"
+    },
+    "main": "main.js",
+    "engines": {
+        "alma": "^0.1.0"
+    },
+    "type": "provider",
+    "permissions": [
+        "network:fetch",
+        "network:localhost",
+        "providers:manage",
+        "notifications"
+    ],
+    "activationEvents": [
+        "onStartup"
+    ],
+    "contributes": {
+        "providers": [
+            {
+                "id": "openai-codex-native",
+                "name": "OpenAI Codex (Native)",
+                "authType": "none"
+            }
+        ]
+    },
+    "keywords": [
+        "openai",
+        "codex",
+        "chatgpt",
+        "gpt-5",
+        "native"
+    ]
+}
