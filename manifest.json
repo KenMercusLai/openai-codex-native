@@ -6,7 +6,7 @@
     "author": {
         "name": "Alma Community"
     },
-    "main": "main.js",
+    "main": "main.ts",
     "engines": {
         "alma": "^0.1.0"
     },

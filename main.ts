@@ -2,6 +2,13 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import { appendFileSync, writeFileSync } from 'node:fs';
+import http from 'node:http';
+import net from 'node:net';
+
+const DEBUG_LOG = '/tmp/codex-native-debug.log';
+try { writeFileSync(DEBUG_LOG, `[${new Date().toISOString()}] Plugin file loaded\n`); } catch {}
+function debugLog(msg: string) { try { appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch {} }
 
 const PROVIDER_ID = 'openai-codex-native';
 const PROVIDER_NAME = 'OpenAI Codex (Native)';
@@ -9,7 +16,6 @@ const PROVIDER_DESCRIPTION = 'Use the local codex CLI app-server as an Alma prov
 const CODEX_BINARY = '/opt/homebrew/bin/codex';
 const CODEX_AUTH_PATH = `${process.env.HOME ?? ''}/.codex/auth.json`;
 const MODELS_CACHE_PATH = `${process.env.HOME ?? ''}/.codex/models_cache.json`;
-const BASE_URL = 'http://openai-codex-native.local/v1';
 const DUMMY_API_KEY = 'codex-native';
 const DEFAULT_CWD = '/tmp';
 const DEFAULT_APPROVAL_POLICY = 'never';
@@ -69,7 +75,7 @@ type AlmaProvider = {
     getSDKConfig(): Promise<{
         apiKey: string;
         baseURL: string;
-        fetch: typeof globalThis.fetch;
+        fetch?: typeof globalThis.fetch;
         useResponsesAPI?: boolean;
     }>;
 };
@@ -373,16 +379,21 @@ class CodexAppServerClient {
 
 class CodexNativeRuntime {
     private readonly client: CodexAppServerClient;
-    private readonly fetchImpl: typeof globalThis.fetch;
+    private httpServer: http.Server | null = null;
+    private serverPort = 0;
     private operationChain: Promise<unknown> = Promise.resolve();
 
     constructor(private readonly logger: Logger) {
         this.client = new CodexAppServerClient(logger);
-        this.fetchImpl = this.createFetch();
     }
 
     async initialize(): Promise<void> {
         await this.client.ensureStarted();
+        await this.startHttpServer();
+    }
+
+    getBaseURL(): string {
+        return `http://127.0.0.1:${this.serverPort}/v1`;
     }
 
     async isAuthenticated(): Promise<boolean> {
@@ -419,68 +430,94 @@ class CodexNativeRuntime {
         return this.getModels();
     }
 
-    getFetch(): typeof globalThis.fetch {
-        return this.fetchImpl;
-    }
-
     async restart(): Promise<void> {
         await this.client.restart();
     }
 
     async dispose(): Promise<void> {
+        await this.stopHttpServer();
         await this.client.dispose();
     }
 
-    private createFetch(): typeof globalThis.fetch {
-        return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-            const url = await resolveRequestUrl(input);
-            const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
+    private async startHttpServer(): Promise<void> {
+        this.serverPort = await findFreePort();
+        this.httpServer = http.createServer((req, res) => {
+            this.handleHttpRequest(req, res).catch((err) => {
+                this.logger.error('HTTP request handler error', err);
+                if (!res.headersSent) {
+                    res.writeHead(500, { 'content-type': 'application/json' });
+                }
+                if (!res.writableEnded) {
+                    res.end(JSON.stringify({ error: { message: 'Internal server error', type: 'server_error' } }));
+                }
+            });
+        });
+        await new Promise<void>((resolve, reject) => {
+            this.httpServer!.listen(this.serverPort, '127.0.0.1', () => resolve());
+            this.httpServer!.on('error', reject);
+        });
+        debugLog(`HTTP server listening on 127.0.0.1:${this.serverPort}`);
+        this.logger.info(`Codex HTTP proxy server listening on 127.0.0.1:${this.serverPort}`);
+    }
 
-            if (url.pathname.endsWith('/models') && method.toUpperCase() === 'GET') {
-                const models = await this.fetchModels();
-                return jsonResponse({
-                    object: 'list',
-                    data: models,
-                });
-            }
+    private async stopHttpServer(): Promise<void> {
+        if (this.httpServer) {
+            await new Promise<void>((resolve) => {
+                this.httpServer!.close(() => resolve());
+            });
+            this.httpServer = null;
+            debugLog('HTTP server stopped');
+        }
+    }
 
-            if (!url.pathname.endsWith('/responses')) {
-                return jsonResponse(
-                    {
-                        error: {
-                            message: `Unsupported endpoint: ${url.pathname}`,
-                            type: 'invalid_request_error',
-                        },
-                    },
-                    404,
-                );
-            }
+    private async handleHttpRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+        const url = new URL(req.url ?? '/', `http://127.0.0.1:${this.serverPort}`);
+        debugLog(`HTTP ${req.method} ${url.pathname}`);
+        debugLog(`Request headers: ${JSON.stringify(req.headers).substring(0, 300)}`);
 
-            const bodyText = await readRequestBody(input, init);
+        if (url.pathname === '/v1/models' && req.method === 'GET') {
+            const models = await this.fetchModels();
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ object: 'list', data: models }));
+            return;
+        }
+
+        if (url.pathname === '/v1/responses' && req.method === 'POST') {
+            const bodyText = await readIncomingBody(req);
             let requestBody: OpenAIRequestBody;
             try {
                 requestBody = bodyText ? JSON.parse(bodyText) as OpenAIRequestBody : {};
             } catch (error) {
-                return jsonResponse(
-                    {
-                        error: {
-                            message: `Invalid JSON request body: ${error instanceof Error ? error.message : String(error)}`,
-                            type: 'invalid_request_error',
-                        },
+                res.writeHead(400, { 'content-type': 'application/json' });
+                res.end(JSON.stringify({
+                    error: {
+                        message: `Invalid JSON request body: ${error instanceof Error ? error.message : String(error)}`,
+                        type: 'invalid_request_error',
                     },
-                    400,
-                );
+                }));
+                return;
             }
 
             const wantsStreaming = requestBody.stream === true;
+            debugLog(`POST /v1/responses stream=${wantsStreaming}, model=${requestBody.model}`);
+            debugLog(`Request body keys: ${Object.keys(requestBody).join(', ')}`);
+            debugLog(`Request body (first 500): ${bodyText.substring(0, 500)}`);
 
-            const streamingResponse = await this.enqueue(() => this.handleResponsesRequest(requestBody));
             if (wantsStreaming) {
-                return streamingResponse;
+                await this.enqueue(() => this.handleStreamingResponse(requestBody, res));
+            } else {
+                await this.enqueue(() => this.handleNonStreamingResponse(requestBody, res));
             }
+            return;
+        }
 
-            return convertSseToJson(streamingResponse);
-        };
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({
+            error: {
+                message: `Unsupported endpoint: ${req.method} ${url.pathname}`,
+                type: 'invalid_request_error',
+            },
+        }));
     }
 
     private enqueue<T>(work: () => Promise<T>): Promise<T> {
@@ -489,15 +526,23 @@ class CodexNativeRuntime {
         return run;
     }
 
-    private async handleResponsesRequest(body: OpenAIRequestBody): Promise<Response> {
+    /**
+     * Core method: sets up a codex thread + turn and emits OpenAI-compatible SSE events
+     * via the provided `emit` callback. Returns a promise that resolves when the turn completes.
+     */
+    private async executeResponsesRequest(
+        body: OpenAIRequestBody,
+        emit: (event: unknown) => void,
+    ): Promise<void> {
         await this.client.ensureStarted();
 
         const toolDefinitions = parseToolDefinitions(body.tools);
         const responseId = `resp_${compactId()}`;
         const messageId = `msg_${compactId()}`;
         const prepared = preparePrompt(body, toolDefinitions);
-
         const modelSpec = resolveModelSpec(body.model, body.reasoning?.effort);
+
+        debugLog(`executeResponsesRequest: calling thread/start, model=${modelSpec.baseModel}`);
         const thread = await this.client.request('thread/start', {
             model: modelSpec.baseModel,
             modelProvider: 'openai',
@@ -509,8 +554,8 @@ class CodexNativeRuntime {
             experimentalRawEvents: true,
             persistExtendedHistory: true,
         });
+        debugLog(`thread/start result: ${JSON.stringify(thread).substring(0, 300)}`);
 
-        const encoder = new TextEncoder();
         const turnState = {
             threadId: String(thread?.thread?.id ?? ''),
             turnId: '',
@@ -527,124 +572,163 @@ class CodexNativeRuntime {
             throw new Error('thread/start did not return a thread id');
         }
 
-        const stream = new ReadableStream<Uint8Array>({
-            start: async (controller) => {
-                const push = (event: unknown) => {
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
-                };
+        emit(buildResponseCreatedEvent(responseId, body.model ?? modelSpec.displayModel));
 
-                push(buildResponseCreatedEvent(responseId, body.model ?? modelSpec.displayModel));
+        return new Promise<void>((resolve, reject) => {
+            let outputInitialized = false;
+            const ensureOutputStarted = () => {
+                if (outputInitialized) return;
+                outputInitialized = true;
+                emit(buildOutputItemAddedEvent(messageId));
+                emit(buildContentPartAddedEvent());
+            };
 
-                let outputInitialized = false;
-                const ensureOutputStarted = () => {
-                    if (outputInitialized) {
-                        return;
+            const finishAsText = () => {
+                ensureOutputStarted();
+                emit(buildOutputTextDoneEvent(turnState.fullText));
+                emit(buildContentPartDoneEvent(turnState.fullText));
+                emit(buildOutputItemDoneEvent(messageId, turnState.fullText));
+                emit(buildResponseCompletedEvent(responseId, body.model ?? modelSpec.displayModel, [
+                    {
+                        type: 'message',
+                        id: messageId,
+                        role: 'assistant',
+                        content: [{ type: 'output_text', text: turnState.fullText, annotations: [] }],
+                        status: 'completed',
+                    },
+                ], turnState.usage));
+            };
+
+            const unsubscribe = this.client.addListener((message) => {
+                const params = message.params ?? {};
+                const threadId = params.threadId;
+                const turnId = params.turnId ?? params.turn?.id;
+
+                if (threadId && threadId !== turnState.threadId) return;
+                if (turnState.turnId && turnId && turnId !== turnState.turnId) return;
+
+                debugLog(`listener event: method=${message.method}, threadId=${threadId}, turnId=${turnId}`);
+                switch (message.method) {
+                    case 'item/agentMessage/delta': {
+                        ensureOutputStarted();
+                        const delta = String(params.delta ?? '');
+                        turnState.fullText += delta;
+                        emit(buildOutputTextDeltaEvent(delta, messageId));
+                        break;
                     }
-                    outputInitialized = true;
-                    push(buildOutputItemAddedEvent(messageId));
-                    push(buildContentPartAddedEvent());
-                };
-
-                const finishAsText = () => {
-                    ensureOutputStarted();
-                    push(buildOutputTextDoneEvent(turnState.fullText));
-                    push(buildContentPartDoneEvent(turnState.fullText));
-                    push(buildOutputItemDoneEvent(messageId, turnState.fullText));
-                    push(buildResponseCompletedEvent(responseId, body.model ?? modelSpec.displayModel, [
-                        {
-                            type: 'message',
-                            id: messageId,
-                            role: 'assistant',
-                            content: [{ type: 'output_text', text: turnState.fullText, annotations: [] }],
-                            status: 'completed',
-                        },
-                    ], turnState.usage));
-                    controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-                    controller.close();
-                };
-
-                const unsubscribe = this.client.addListener((message) => {
-                    const params = message.params ?? {};
-                    const threadId = params.threadId;
-                    const turnId = params.turnId ?? params.turn?.id;
-
-                    if (threadId && threadId !== turnState.threadId) {
-                        return;
-                    }
-
-                    if (turnState.turnId && turnId && turnId !== turnState.turnId) {
-                        return;
-                    }
-
-                    switch (message.method) {
-                        case 'item/agentMessage/delta': {
-                            ensureOutputStarted();
-                            const delta = String(params.delta ?? '');
-                            turnState.fullText += delta;
-                            push(buildOutputTextDeltaEvent(delta));
-                            break;
+                    case 'item/completed': {
+                        const item = params.item;
+                        if (item?.type === 'agentMessage' && typeof item.text === 'string') {
+                            turnState.fullText = item.text;
                         }
-                        case 'item/completed': {
-                            const item = params.item;
-                            if (item?.type === 'agentMessage' && typeof item.text === 'string') {
-                                turnState.fullText = item.text;
-                            }
-                            break;
-                        }
-                        case 'thread/tokenUsage/updated': {
-                            const last = params.tokenUsage?.last;
-                            if (last) {
-                                turnState.usage = {
-                                    input_tokens: Number(last.inputTokens ?? 0),
-                                    output_tokens: Number(last.outputTokens ?? 0),
-                                    total_tokens: Number(last.totalTokens ?? 0),
-                                };
-                            }
-                            break;
-                        }
-                        case 'turn/completed': {
-                            if (turnState.completed) {
-                                return;
-                            }
-                            turnState.completed = true;
-                            unsubscribe();
-                            finishAsText();
-                            break;
-                        }
+                        break;
                     }
-                });
-
-                try {
-                    const turn = await this.client.request('turn/start', {
-                        threadId: turnState.threadId,
-                        input: prepared.userInput.length > 0
-                            ? prepared.userInput
-                            : [{ type: 'text', text: '[user]\nContinue.', text_elements: [] }],
-                        cwd: DEFAULT_CWD,
-                        approvalPolicy: DEFAULT_APPROVAL_POLICY,
-                        model: modelSpec.baseModel,
-                        effort: modelSpec.reasoningEffort,
-                        outputSchema: prepared.outputSchema,
-                    });
-                    turnState.turnId = String(turn?.turn?.id ?? '');
-                    if (!turnState.turnId) {
-                        throw new Error('turn/start did not return a turn id');
+                    case 'thread/tokenUsage/updated': {
+                        const last = params.tokenUsage?.last;
+                        if (last) {
+                            turnState.usage = {
+                                input_tokens: Number(last.inputTokens ?? 0),
+                                output_tokens: Number(last.outputTokens ?? 0),
+                                total_tokens: Number(last.totalTokens ?? 0),
+                            };
+                        }
+                        break;
                     }
-                } catch (error) {
-                    unsubscribe();
-                    controller.error(error);
+                    case 'turn/completed': {
+                        debugLog(`turn/completed, fullText length=${turnState.fullText.length}`);
+                        if (turnState.completed) return;
+                        turnState.completed = true;
+                        unsubscribe();
+                        finishAsText();
+                        resolve();
+                        break;
+                    }
                 }
-            },
+            });
+
+            this.client.request('turn/start', {
+                threadId: turnState.threadId,
+                input: prepared.userInput.length > 0
+                    ? prepared.userInput
+                    : [{ type: 'text', text: '[user]\nContinue.', text_elements: [] }],
+                cwd: DEFAULT_CWD,
+                approvalPolicy: DEFAULT_APPROVAL_POLICY,
+                model: modelSpec.baseModel,
+                effort: modelSpec.reasoningEffort,
+                outputSchema: prepared.outputSchema,
+            }).then((turn) => {
+                debugLog(`turn/start result: ${JSON.stringify(turn).substring(0, 300)}`);
+                turnState.turnId = String(turn?.turn?.id ?? '');
+                if (!turnState.turnId) {
+                    unsubscribe();
+                    reject(new Error('turn/start did not return a turn id'));
+                }
+                debugLog(`turn/start success, turnId=${turnState.turnId}`);
+            }).catch((error: any) => {
+                debugLog(`turn/start ERROR: ${error?.message ?? String(error)}`);
+                unsubscribe();
+                reject(error);
+            });
+        });
+    }
+
+    private async handleStreamingResponse(body: OpenAIRequestBody, res: http.ServerResponse): Promise<void> {
+        debugLog('handleStreamingResponse: starting');
+        res.writeHead(200, {
+            'content-type': 'text/event-stream; charset=utf-8',
+            'cache-control': 'no-cache',
+            'connection': 'keep-alive',
         });
 
-        return new Response(stream, {
-            status: 200,
-            headers: {
-                'content-type': 'text/event-stream; charset=utf-8',
-                'cache-control': 'no-cache',
-                connection: 'keep-alive',
-            },
+        res.on('close', () => {
+            debugLog('handleStreamingResponse: res CLOSED by client');
         });
+        res.on('error', (err) => {
+            debugLog(`handleStreamingResponse: res ERROR: ${err.message}`);
+        });
+
+        let eventCount = 0;
+        try {
+            await this.executeResponsesRequest(body, (event) => {
+                eventCount++;
+                const data = `data: ${JSON.stringify(event)}\n\n`;
+                debugLog(`SSE write #${eventCount}: ${data.substring(0, 100)}`);
+                res.write(data);
+            });
+            debugLog(`handleStreamingResponse: writing [DONE] after ${eventCount} events`);
+            res.write('data: [DONE]\n\n');
+        } catch (error: any) {
+            debugLog(`handleStreamingResponse error: ${error?.message ?? String(error)}`);
+            const errorEvent = {
+                type: 'error',
+                error: { message: error?.message ?? 'Internal error', type: 'server_error' },
+            };
+            res.write(`data: ${JSON.stringify(errorEvent)}\n\n`);
+        }
+        debugLog('handleStreamingResponse: calling res.end()');
+        res.end();
+    }
+
+    private async handleNonStreamingResponse(body: OpenAIRequestBody, res: http.ServerResponse): Promise<void> {
+        const events: unknown[] = [];
+        try {
+            await this.executeResponsesRequest(body, (event) => {
+                events.push(event);
+            });
+            const finalResponse = convertSseToJson(events);
+            res.writeHead(200, { 'content-type': 'application/json' });
+            res.end(JSON.stringify(finalResponse ?? {}));
+        } catch (error: any) {
+            debugLog(`handleNonStreamingResponse error: ${error?.message ?? String(error)}`);
+            if (!res.headersSent) {
+                res.writeHead(500, { 'content-type': 'application/json' });
+            }
+            if (!res.writableEnded) {
+                res.end(JSON.stringify({
+                    error: { message: error?.message ?? 'Internal error', type: 'server_error' },
+                }));
+            }
+        }
     }
 }
 
@@ -677,10 +761,11 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         },
 
         async getSDKConfig() {
+            const baseURL = runtime.getBaseURL();
+            debugLog(`getSDKConfig: baseURL=${baseURL}`);
             return {
                 apiKey: DUMMY_API_KEY,
-                baseURL: BASE_URL,
-                fetch: runtime.getFetch(),
+                baseURL,
                 useResponsesAPI: true,
             };
         },
@@ -702,6 +787,7 @@ export async function activate(context: PluginContext): Promise<PluginActivation
         ui.showNotification('Codex app-server restarted', { type: 'success' });
     });
 
+    debugLog('Plugin activate() called successfully');
     logger.info('OpenAI Codex Native plugin activated');
 
     return {
@@ -1159,9 +1245,10 @@ function buildContentPartAddedEvent() {
     };
 }
 
-function buildOutputTextDeltaEvent(delta: string) {
+function buildOutputTextDeltaEvent(delta: string, itemId: string) {
     return {
         type: 'response.output_text.delta',
+        item_id: itemId,
         output_index: 0,
         content_index: 0,
         delta,
@@ -1227,87 +1314,34 @@ function buildResponseCompletedEvent(
     };
 }
 
-async function resolveRequestUrl(input: RequestInfo | URL): Promise<URL> {
-    if (typeof input === 'string') {
-        return new URL(input);
-    }
-    if (input instanceof URL) {
-        return input;
-    }
-    return new URL(input.url);
-}
-
-async function readRequestBody(input: RequestInfo | URL, init?: RequestInit): Promise<string> {
-    if (typeof init?.body === 'string') {
-        return init.body;
-    }
-
-    if (init?.body instanceof Uint8Array) {
-        return new TextDecoder().decode(init.body);
-    }
-
-    if (typeof input !== 'string' && !(input instanceof URL) && input instanceof Request) {
-        return input.clone().text();
-    }
-
-    return '';
-}
-
-async function convertSseToJson(response: Response): Promise<Response> {
-    if (!response.body) {
-        return response;
-    }
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let fullText = '';
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) {
-            break;
-        }
-        fullText += decoder.decode(value, { stream: true });
-    }
-
-    let finalResponse: unknown = null;
-    for (const line of fullText.split('\n')) {
-        if (!line.startsWith('data: ')) {
-            continue;
-        }
-        const payload = line.slice(6);
-        if (payload === '[DONE]') {
-            continue;
-        }
-        try {
-            const parsed = JSON.parse(payload);
-            if (parsed.type === 'response.completed' || parsed.type === 'response.done') {
-                finalResponse = parsed.response;
-            }
-        } catch {
-            // Ignore malformed SSE lines.
-        }
-    }
-
-    if (finalResponse == null) {
-        return response;
-    }
-
-    return new Response(JSON.stringify(finalResponse), {
-        status: response.status,
-        headers: {
-            'content-type': 'application/json; charset=utf-8',
-        },
+function findFreePort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+        const server = net.createServer();
+        server.listen(0, '127.0.0.1', () => {
+            const addr = server.address() as net.AddressInfo;
+            const port = addr.port;
+            server.close(() => resolve(port));
+        });
+        server.on('error', reject);
     });
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
-    return new Response(JSON.stringify(body), {
-        status,
-        headers: {
-            'content-type': 'application/json; charset=utf-8',
-        },
+function readIncomingBody(req: http.IncomingMessage): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        req.on('error', reject);
     });
+}
+
+function convertSseToJson(events: unknown[]): unknown | null {
+    for (const event of events) {
+        if (isRecord(event) && (event.type === 'response.completed' || event.type === 'response.done')) {
+            return event.response;
+        }
+    }
+    return null;
 }
 
 function toTextInput(text: string): CodexUserInput {
