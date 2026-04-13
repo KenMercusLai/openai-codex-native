@@ -4,7 +4,7 @@
     "version": "1.0.0",
     "description": "Use ChatGPT Plus/Pro subscription with Alma via local Codex CLI app-server. Bypasses Cloudflare by delegating requests to the codex binary.",
     "author": {
-        "name": "Alma Community"
+        "name": "Ken Lai"
     },
     "main": "main.ts",
     "engines": {
